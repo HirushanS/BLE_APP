@@ -57,6 +57,10 @@ class BLEBrowserApp(ctk.CTk):
         self.compact_values = ctk.BooleanVar(value=True)
         self.text_mode = ctk.BooleanVar(value=False)
 
+        # Byte editor variables
+        self.byte_entries = []
+        self.byte_name_entries = []
+
         self._build_ui()
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -130,33 +134,34 @@ class BLEBrowserApp(ctk.CTk):
         self.read_btn = ctk.CTkButton(ctl_box, text="Read", state="disabled", command=self.on_read)
         self.read_btn.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="w")
 
-        self.write_entry = ctk.CTkEntry(ctl_box, placeholder_text="Hex: 01 A0 0D   (or enable Text mode)", width=380)
-        self.write_entry.grid(row=2, column=1, sticky="ew", pady=(0, 10))
-
-        ctk.CTkCheckBox(ctl_box, text="Text mode", variable=self.text_mode).grid(row=2, column=2, sticky="w", padx=8, pady=(0, 10))
-
-        self.write_btn = ctk.CTkButton(ctl_box, text="Write", state="disabled", command=self.on_write)
-        self.write_btn.grid(row=2, column=3, padx=(8, 10), pady=(0, 10), sticky="e")
-
         self.notify_btn = ctk.CTkButton(ctl_box, text="Subscribe", state="disabled", command=self.on_toggle_notify)
-        self.notify_btn.grid(row=3, column=3, padx=(8, 10), pady=(0, 12), sticky="e")
+        self.notify_btn.grid(row=2, column=3, padx=(8, 10), pady=(0, 12), sticky="e")
 
         # Byte size selection row
         byte_size_frame = ctk.CTkFrame(ctl_box, fg_color="transparent")
-        byte_size_frame.grid(row=4, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 10))
+        byte_size_frame.grid(row=3, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 10))
         byte_size_frame.grid_columnconfigure(1, weight=1)
         
         ctk.CTkLabel(byte_size_frame, text="Byte Size:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        self.byte_size_var = ctk.StringVar(value="0")
+        self.byte_size_var = ctk.StringVar(value="4")
         self.byte_size_entry = ctk.CTkEntry(byte_size_frame, textvariable=self.byte_size_var, width=80)
         self.byte_size_entry.grid(row=0, column=1, sticky="w", padx=(0, 8))
         
-        self.create_empty_btn = ctk.CTkButton(byte_size_frame, text="Create Empty Bytes", 
-                                             command=self.on_create_empty_bytes, width=140)
-        self.create_empty_btn.grid(row=0, column=2, sticky="w", padx=(0, 8))
+        self.create_bytes_btn = ctk.CTkButton(byte_size_frame, text="Create Byte Editor", 
+                                             command=self.on_create_byte_editor, width=140)
+        self.create_bytes_btn.grid(row=0, column=2, sticky="w", padx=(0, 8))
         
         self.bytes_info_lbl = ctk.CTkLabel(byte_size_frame, text="Bytes: 0", text_color="gray")
         self.bytes_info_lbl.grid(row=0, column=3, sticky="e")
+
+        # Byte editor frame
+        self.byte_editor_frame = ctk.CTkFrame(ctl_box, fg_color="transparent")
+        self.byte_editor_frame.grid(row=4, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 10))
+        self.byte_editor_frame.grid_columnconfigure(0, weight=1)
+
+        # Write button
+        self.write_btn = ctk.CTkButton(ctl_box, text="Write Bytes", state="disabled", command=self.on_write)
+        self.write_btn.grid(row=5, column=3, padx=(8, 10), pady=(0, 10), sticky="e")
 
         # --- Bottom panes: Log (left) | Right (Decoded + Values) ---
         bottom = ctk.CTkFrame(self)
@@ -435,17 +440,11 @@ class BLEBrowserApp(ctk.CTk):
         uuid = self.char_var.get()
         if not uuid:
             return
-        text = self.write_entry.get().strip()
-        if not text:
+        
+        # Get bytes from byte editor
+        payload = self._get_bytes_from_editor()
+        if payload is None:
             return
-
-        if self.text_mode.get():
-            payload = text.encode("utf-8", errors="ignore")
-        else:
-            ok, payload = self._parse_hex(text)
-            if not ok:
-                self.log("Write: hex parse error. Use '01 A0 0D' or '01,a0,0d'")
-                return
 
         fut = self.bridge.run_coro(self._write_async(uuid, payload))
         fut.add_done_callback(lambda _f: None)
@@ -528,28 +527,83 @@ class BLEBrowserApp(ctk.CTk):
             decoded = self._decode_status(data)
             self.after(0, lambda d=decoded: self._update_decoded(d))
 
-    # ---------- Byte Size Functions ----------
-    def on_create_empty_bytes(self):
+    # ---------- Byte Editor Functions ----------
+    def on_create_byte_editor(self):
         try:
             size = int(self.byte_size_var.get())
-            if size < 0:
+            if size <= 0:
                 self.log("Error: Byte size must be a positive integer")
                 return
+            if size > 64:
+                self.log("Warning: Large byte size may affect performance")
                 
-            # Create empty byte array
-            empty_bytes = bytes([0] * size)
-            hex_str = " ".join(f"{b:02X}" for b in empty_bytes)
+            # Clear existing byte editor
+            for widget in self.byte_editor_frame.winfo_children():
+                widget.destroy()
+                
+            self.byte_entries = []
+            self.byte_name_entries = []
             
-            # Update the write entry
-            self.write_entry.delete(0, "end")
-            self.write_entry.insert(0, hex_str)
+            # Create header
+            header_frame = ctk.CTkFrame(self.byte_editor_frame, fg_color="transparent")
+            header_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 5))
+            
+            ctk.CTkLabel(header_frame, text="Byte Name", font=("Arial", 11, "bold")).grid(row=0, column=0, padx=(0, 10))
+            ctk.CTkLabel(header_frame, text="Value (Hex)", font=("Arial", 11, "bold")).grid(row=0, column=1, padx=(0, 10))
+            ctk.CTkLabel(header_frame, text="Index", font=("Arial", 11, "bold")).grid(row=0, column=2)
+            
+            # Create byte editor rows
+            for i in range(size):
+                row_frame = ctk.CTkFrame(self.byte_editor_frame, fg_color="transparent")
+                row_frame.grid(row=i+1, column=0, columnspan=3, sticky="ew", pady=2)
+                
+                # Byte name entry
+                name_var = ctk.StringVar(value=f"Byte {i+1}")
+                name_entry = ctk.CTkEntry(row_frame, textvariable=name_var, width=120)
+                name_entry.grid(row=0, column=0, padx=(0, 10))
+                self.byte_name_entries.append(name_var)
+                
+                # Byte value entry
+                value_var = ctk.StringVar(value="00")
+                value_entry = ctk.CTkEntry(row_frame, textvariable=value_var, width=80)
+                value_entry.grid(row=0, column=1, padx=(0, 10))
+                self.byte_entries.append(value_var)
+                
+                # Byte index label
+                ctk.CTkLabel(row_frame, text=f"#{i}", text_color="gray").grid(row=0, column=2)
             
             # Update the info label
             self.bytes_info_lbl.configure(text=f"Bytes: {size}")
             
-            self.log(f"Created empty byte array of size {size}: {hex_str}")
+            self.log(f"Created byte editor with {size} bytes")
+            
         except ValueError:
             self.log("Error: Please enter a valid integer for byte size")
+    
+    def _get_bytes_from_editor(self):
+        """Convert byte editor values to bytes"""
+        if not self.byte_entries:
+            self.log("Error: No byte editor created. Please create one first.")
+            return None
+            
+        bytes_list = []
+        for i, value_var in enumerate(self.byte_entries):
+            value = value_var.get().strip()
+            if not value:
+                self.log(f"Error: Byte #{i} value is empty")
+                return None
+                
+            try:
+                # Handle single hex values (like "A" becomes "0A")
+                if len(value) == 1:
+                    value = "0" + value
+                byte_val = int(value, 16) & 0xFF
+                bytes_list.append(byte_val)
+            except ValueError:
+                self.log(f"Error: Invalid hex value '{value}' for byte #{i}")
+                return None
+                
+        return bytes(bytes_list)
 
     # ---------- Decoding ----------
     @staticmethod
