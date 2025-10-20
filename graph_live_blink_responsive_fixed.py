@@ -1,8 +1,9 @@
-# ble_ctk_browser.py
+# ble_ctk_browser_browser_tabs.py
+# BLE Browser with browser-like top tabs (CustomTkinter + Bleak)
+
 import asyncio
 import threading
 import re
-from functools import partial
 from typing import Optional, Dict, List, Tuple, Union
 
 import customtkinter as ctk
@@ -36,12 +37,12 @@ class AsyncioBridge:
 class BLEBrowserApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        ctk.set_appearance_mode("dark")   # "light" or "system"
-        ctk.set_default_color_theme("blue")  # "dark-blue" / "green" etc.
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
 
         self.title("BLE Browser (CustomTkinter + Bleak)")
         self.geometry("1280x800")
-        self.minsize(1050, 650)
+        self.minsize(1100, 650)
 
         self.bridge = AsyncioBridge()
 
@@ -55,26 +56,29 @@ class BLEBrowserApp(ctk.CTk):
 
         # UI state
         self.compact_values = ctk.BooleanVar(value=True)
-        self.text_mode = ctk.BooleanVar(value=False)
 
         # Byte editor variables
-        self.byte_entries = []
-        self.byte_name_entries = []
+        self.byte_entries: List[ctk.StringVar] = []
+        self.byte_name_entries: List[ctk.StringVar] = []
+
+        # Top-tab bar + per-char pages
+        self.active_tab_uuid: Optional[str] = None
+        self.browser_tabs: Dict[str, Dict[str, object]] = {}   # uuid -> {frame, btn, close}
+        self.char_pages: Dict[str, Dict[str, object]] = {}     # uuid -> {frame, props, text, btn_read, btn_sub, btn_write}
 
         self._build_ui()
-
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ---------- UI ----------
     def _build_ui(self):
-        # grid: 3 rows (toolbar, mid controls, bottom panes)
-        self.grid_rowconfigure(2, weight=1)
+        # Main grid: 0 toolbar, 1 top-tabs, 2 mid controls, 3 bottom panes
+        self.grid_rowconfigure(3, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
         # --- Toolbar ---
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
-        bar.grid_columnconfigure(5, weight=1)
+        bar.grid_columnconfigure(6, weight=1)
 
         self.scan_btn = ctk.CTkButton(bar, text="Scan", command=self.on_scan)
         self.scan_btn.grid(row=0, column=0, padx=(0, 8))
@@ -86,19 +90,26 @@ class BLEBrowserApp(ctk.CTk):
         self.disconnect_btn.grid(row=0, column=2, padx=8)
 
         self.status_lbl = ctk.CTkLabel(bar, text="Idle")
-        self.status_lbl.grid(row=0, column=5, sticky="e", padx=(8, 8))
+        self.status_lbl.grid(row=0, column=6, sticky="e", padx=(8, 8))
 
-        # theme toggle + scale
-        self.theme_var = ctk.StringVar(value="dark")
-        theme = ctk.CTkSegmentedButton(bar, values=["light", "dark"], variable=self.theme_var, command=self._change_theme)
-        theme.grid(row=0, column=6, padx=(8, 0))
+        theme = ctk.CTkSegmentedButton(bar, values=["light", "dark"], command=self._change_theme)
+        theme.set("dark")
+        theme.grid(row=0, column=7, padx=(8, 0))
         scale = ctk.CTkOptionMenu(bar, values=["90%", "100%", "110%", "125%"], command=self._change_scale)
         scale.set("100%")
-        scale.grid(row=0, column=7, padx=(8, 0))
+        scale.grid(row=0, column=8, padx=(8, 0))
+
+        # --- Browser-like top tab bar (under toolbar, full width) ---
+        tabs_outer = ctk.CTkFrame(self, fg_color="transparent", height=36)
+        tabs_outer.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
+        tabs_outer.grid_columnconfigure(0, weight=1)
+
+        self.tabs_strip = ctk.CTkFrame(tabs_outer, corner_radius=10)
+        self.tabs_strip.grid(row=0, column=0, sticky="w", padx=0, pady=0)
 
         # --- Middle strip: Devices (left) + Controls (right) ---
         mid = ctk.CTkFrame(self)
-        mid.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+        mid.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 8))
         mid.grid_columnconfigure(0, weight=2)
         mid.grid_columnconfigure(1, weight=3)
         mid.grid_rowconfigure(1, weight=1)
@@ -111,7 +122,7 @@ class BLEBrowserApp(ctk.CTk):
 
         ctk.CTkLabel(dev_box, text="Discovered Devices").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 0))
 
-        self.device_var = ctk.StringVar(value="")  # store selected device index as string
+        self.device_var = ctk.StringVar(value="")
         self.device_list = ctk.CTkScrollableFrame(dev_box, height=180)
         self.device_list.grid(row=1, column=0, sticky="nsew", padx=10, pady=(6, 10))
 
@@ -124,53 +135,49 @@ class BLEBrowserApp(ctk.CTk):
 
         ctk.CTkLabel(ctl_box, text="Characteristic:").grid(row=1, column=0, sticky="w", padx=10, pady=(6, 6))
         self.char_var = ctk.StringVar(value="")
-        self.char_combo = ctk.CTkComboBox(ctl_box, variable=self.char_var, values=[], width=600, command=lambda _: self._on_char_selected())
+        self.char_combo = ctk.CTkComboBox(ctl_box, variable=self.char_var, values=[], width=600,
+                                          command=lambda _: self._on_char_selected())
         self.char_combo.grid(row=1, column=1, columnspan=2, sticky="ew", padx=8, pady=6)
 
         self.props_lbl = ctk.CTkLabel(ctl_box, text="Props: -")
         self.props_lbl.grid(row=1, column=3, sticky="e", padx=(8, 10))
 
-        # RW/Notify row
+        # RW/Notify (global quick buttons for current combo selection)
         self.read_btn = ctk.CTkButton(ctl_box, text="Read", state="disabled", command=self.on_read)
         self.read_btn.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="w")
 
         self.notify_btn = ctk.CTkButton(ctl_box, text="Subscribe", state="disabled", command=self.on_toggle_notify)
         self.notify_btn.grid(row=2, column=3, padx=(8, 10), pady=(0, 12), sticky="e")
 
-        # Byte size selection row
+        # Byte size + editor (global; tabs can write using this payload)
         byte_size_frame = ctk.CTkFrame(ctl_box, fg_color="transparent")
         byte_size_frame.grid(row=3, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 10))
         byte_size_frame.grid_columnconfigure(1, weight=1)
-        
+
         ctk.CTkLabel(byte_size_frame, text="Byte Size:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.byte_size_var = ctk.StringVar(value="4")
         self.byte_size_entry = ctk.CTkEntry(byte_size_frame, textvariable=self.byte_size_var, width=80)
         self.byte_size_entry.grid(row=0, column=1, sticky="w", padx=(0, 8))
-        
-        self.create_bytes_btn = ctk.CTkButton(byte_size_frame, text="Create Byte Editor", 
-                                             command=self.on_create_byte_editor, width=140)
+        self.create_bytes_btn = ctk.CTkButton(byte_size_frame, text="Create Byte Editor",
+                                              command=self.on_create_byte_editor, width=140)
         self.create_bytes_btn.grid(row=0, column=2, sticky="w", padx=(0, 8))
-        
         self.bytes_info_lbl = ctk.CTkLabel(byte_size_frame, text="Bytes: 0", text_color="gray")
         self.bytes_info_lbl.grid(row=0, column=3, sticky="e")
 
-        # Byte editor frame
         self.byte_editor_frame = ctk.CTkFrame(ctl_box, fg_color="transparent")
         self.byte_editor_frame.grid(row=4, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 10))
         self.byte_editor_frame.grid_columnconfigure(0, weight=1)
-
-        # Write button
         self.write_btn = ctk.CTkButton(ctl_box, text="Write Bytes", state="disabled", command=self.on_write)
         self.write_btn.grid(row=5, column=3, padx=(8, 10), pady=(0, 10), sticky="e")
 
-        # --- Bottom panes: Log (left) | Right (Decoded + Values) ---
+        # --- Bottom panes: Log (left) | Right (Decoded + Values + Per-char page stack) ---
         bottom = ctk.CTkFrame(self)
-        bottom.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        bottom.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
         bottom.grid_columnconfigure(0, weight=2)
         bottom.grid_columnconfigure(1, weight=3)
         bottom.grid_rowconfigure(1, weight=1)
 
-        # Log
+        # Global Log
         ctk.CTkLabel(bottom, text="Log / Services").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 0))
         self.output = ctk.CTkTextbox(bottom, wrap="none", font=("Consolas", 11))
         self.output.grid(row=1, column=0, sticky="nsew", padx=(10, 8), pady=(6, 10))
@@ -181,14 +188,13 @@ class BLEBrowserApp(ctk.CTk):
         right.grid_columnconfigure(0, weight=1)
         right.grid_rowconfigure(1, weight=1)
         right.grid_rowconfigure(3, weight=2)
+        right.grid_rowconfigure(5, weight=3)
 
-        # Decoded table (scrollable key/value)
         ctk.CTkLabel(right, text="Decoded Status").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 0))
         self.decoded_frame = ctk.CTkScrollableFrame(right)
         self.decoded_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(6, 10))
-        self._decoded_rows: Dict[str, Tuple[ctk.CTkLabel, ctk.CTkLabel]] = {}  # name -> (name_lbl, value_lbl)
+        self._decoded_rows: Dict[str, Tuple[ctk.CTkLabel, ctk.CTkLabel]] = {}
 
-        # Values viewer
         values_hdr = ctk.CTkFrame(right, fg_color="transparent")
         values_hdr.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 0))
         values_hdr.grid_columnconfigure(0, weight=1)
@@ -198,6 +204,12 @@ class BLEBrowserApp(ctk.CTk):
         self.values_txt = ctk.CTkTextbox(right, wrap="none", font=("Consolas", 11))
         self.values_txt.configure(state="disabled")
         self.values_txt.grid(row=3, column=0, sticky="nsew", padx=10, pady=(6, 10))
+
+        ctk.CTkLabel(right, text="Characteristic page").grid(row=4, column=0, sticky="w", padx=10, pady=(0, 0))
+        self.char_pages_container = ctk.CTkFrame(right)
+        self.char_pages_container.grid(row=5, column=0, sticky="nsew", padx=10, pady=(6, 10))
+        self.char_pages_container.grid_columnconfigure(0, weight=1)
+        self.char_pages_container.grid_rowconfigure(1, weight=1)
 
     # ---------- Helpers ----------
     def _change_theme(self, mode):
@@ -212,11 +224,8 @@ class BLEBrowserApp(ctk.CTk):
         self.update_idletasks()
 
     def log(self, text: str):
-        # main log
         self.output.insert("end", text + "\n")
         self.output.see("end")
-
-        # mirrored compact payloads
         if text.startswith("[READ ") or text.startswith("[NOTIF "):
             line = self._compact_line(text) if self.compact_values.get() else text
             self.values_txt.configure(state="normal")
@@ -236,26 +245,20 @@ class BLEBrowserApp(ctk.CTk):
 
     # ---------- Device list ----------
     def _refresh_device_list(self):
-        # clear
         for child in self.device_list.winfo_children():
             child.destroy()
-
-        # rebuild
         for idx, d in enumerate(self.devices):
             name = d.name or "(Unknown)"
             addr = getattr(d, "address", getattr(d, "mac_address", "??"))
-
             rb = ctk.CTkRadioButton(
                 self.device_list,
                 text=f"{name}   [{addr}]",
                 variable=self.device_var,
                 value=str(idx),
                 command=self._on_device_pick,
-                width=800,          # optional width
+                width=800,
             )
-            # <-- anchor belongs to the geometry manager, not the widget:
             rb.pack(fill="x", padx=6, pady=3, anchor="w")
-
 
     def _on_device_pick(self):
         self.connect_btn.configure(state=("normal" if self.device_var.get() else "disabled"))
@@ -295,7 +298,6 @@ class BLEBrowserApp(ctk.CTk):
         device = self._selected_device()
         if not device:
             return
-
         if self.client and getattr(self.client, "is_connected", False):
             self.on_disconnect()
 
@@ -327,7 +329,6 @@ class BLEBrowserApp(ctk.CTk):
         connected_flag = bool(getattr(self.client, "is_connected", False))
         self.after(0, lambda s=connected_flag: self.log(f"Connected: {s}"))
 
-        # Service discovery (version-agnostic)
         try:
             services_coll = getattr(self.client, "services", None)
             if not services_coll or len(list(services_coll)) == 0:
@@ -341,7 +342,6 @@ class BLEBrowserApp(ctk.CTk):
             self.after(0, lambda m=f"Failed to obtain services: {exc}": self.log(m))
             return
 
-        # Log services & build char index
         char_items: List[str] = []
         for svc in services_coll:
             self.after(0, lambda s=svc: self.log(f"[Service] {s.uuid}: {s.description}"))
@@ -349,7 +349,6 @@ class BLEBrowserApp(ctk.CTk):
                 props = ",".join(ch.properties)
                 self.after(0, lambda c=ch, p=props: self.log(f"  [Char] {c.uuid}: {c.description} (props: {p})"))
                 uuid = str(ch.uuid)
-                # Store UUID, char object, AND handle
                 self.char_index[uuid] = (str(svc.uuid), ch, ch.handle)
                 char_items.append(uuid)
 
@@ -365,7 +364,6 @@ class BLEBrowserApp(ctk.CTk):
         uuid = self.char_var.get()
         props = []
         if uuid and uuid in self.char_index:
-            # Get service UUID, char object, and handle
             _svc_uuid, ch, _handle = self.char_index[uuid]
             props = list(getattr(ch, "properties", []))
         self.props_lbl.configure(text=f"Props: {','.join(props) if props else '-'}")
@@ -374,6 +372,12 @@ class BLEBrowserApp(ctk.CTk):
         self.write_btn.configure(state=("normal" if ("write" in props or "write-without-response" in props) else "disabled"))
         self.notify_btn.configure(state=("normal" if "notify" in props or "indicate" in props else "disabled"))
         self.notify_btn.configure(text=("Unsubscribe" if self.notify_active_uuid == uuid else "Subscribe"))
+
+        if uuid:
+            # Create/select a top tab and corresponding page
+            self._ensure_browser_tab(uuid)
+            self._ensure_char_page(uuid)
+            self._select_browser_tab(uuid)
 
     def _post_connect_ui(self):
         if self.client and getattr(self.client, "is_connected", False):
@@ -397,7 +401,6 @@ class BLEBrowserApp(ctk.CTk):
         try:
             if self.notify_active_uuid:
                 try:
-                    # Stop notifications using handle instead of UUID
                     if self.notify_active_uuid in self.char_index:
                         _, _, handle = self.char_index[self.notify_active_uuid]
                         await self.client.stop_notify(handle)
@@ -430,22 +433,21 @@ class BLEBrowserApp(ctk.CTk):
             hex_str = " ".join(f"{b:02X}" for b in data[:64])
             msg = f"[READ {uuid}] {hex_str}" + (f" … (len={len(data)})" if len(data) > 64 else f" (len={len(data)})")
             self.after(0, lambda m=msg: self.log(m))
+            self.after(0, lambda u=uuid, m=msg: self._append_to_char_page(u, m))
             if len(data) >= 34:
                 decoded = self._decode_status(data)
                 self.after(0, lambda d=decoded: self._update_decoded(d))
         except Exception as exc:
             self.after(0, lambda m=f"[READ {uuid}] Failed: {exc}": self.log(m))
+            self.after(0, lambda u=uuid, m=f"[READ {uuid}] Failed: {exc}": self._append_to_char_page(u, m))
 
     def on_write(self):
         uuid = self.char_var.get()
         if not uuid:
             return
-        
-        # Get bytes from byte editor
         payload = self._get_bytes_from_editor()
         if payload is None:
             return
-
         fut = self.bridge.run_coro(self._write_async(uuid, payload))
         fut.add_done_callback(lambda _f: None)
 
@@ -460,74 +462,228 @@ class BLEBrowserApp(ctk.CTk):
             shown = " ".join(f"{b:02X}" for b in payload[:64])
             msg = f"[WRITE {uuid}] {shown}" + (" …" if len(payload) > 64 else "")
             self.after(0, lambda m=msg: self.log(m))
+            self.after(0, lambda u=uuid, m=msg: self._append_to_char_page(u, m))
         except Exception as exc:
             self.after(0, lambda m=f"[WRITE {uuid}] Failed: {exc}": self.log(m))
+            self.after(0, lambda u=uuid, m=f"[WRITE {uuid}] Failed: {exc}": self._append_to_char_page(u, m))
 
     def on_toggle_notify(self):
         uuid = self.char_var.get()
         if not uuid:
             return
-
         if self.notify_active_uuid == uuid:
             fut = self.bridge.run_coro(self._stop_notify_async(uuid))
-            fut.add_done_callback(lambda _f: self.after(0, self._notify_stopped_ui))
+            fut.add_done_callback(lambda _f: self.after(0, self._notify_stopped_ui_for, uuid))
         else:
             fut = self.bridge.run_coro(self._start_notify_async(uuid))
-            fut.add_done_callback(lambda _f: self.after(0, self._notify_started_ui, uuid))
+            fut.add_done_callback(lambda _f: self.after(0, self._notify_started_ui_for, uuid))
 
     async def _start_notify_async(self, uuid: str):
         try:
             if uuid in self.char_index:
-                # Get the handle from our stored characteristic info
-                _svc_uuid, ch, handle = self.char_index[uuid]
-                # Use handle instead of UUID for notification subscription
+                _svc_uuid, _ch, handle = self.char_index[uuid]
                 await self.client.start_notify(handle, self._notification_handler)
                 self.notify_active_uuid = uuid
                 self.after(0, lambda: self.log(f"[NOTIFY {uuid}] Subscribed using handle {handle}"))
+                self.after(0, lambda u=uuid: self._append_to_char_page(u, f"[NOTIFY {uuid}] Subscribed"))
             else:
                 self.after(0, lambda: self.log(f"[NOTIFY {uuid}] Characteristic not found in index"))
         except Exception as exc:
             self.after(0, lambda m=f"[NOTIFY {uuid}] Failed to subscribe: {exc}": self.log(m))
+            self.after(0, lambda u=uuid, m=f"[NOTIFY {uuid}] Failed to subscribe: {exc}": self._append_to_char_page(u, m))
 
     async def _stop_notify_async(self, uuid: str):
         try:
             if uuid in self.char_index:
-                # Get the handle from our stored characteristic info
-                _svc_uuid, ch, handle = self.char_index[uuid]
-                # Use handle instead of UUID for stopping notification
+                _svc_uuid, _ch, handle = self.char_index[uuid]
                 await self.client.stop_notify(handle)
                 self.after(0, lambda: self.log(f"[NOTIFY {uuid}] Unsubscribed"))
+                self.after(0, lambda u=uuid: self._append_to_char_page(u, f"[NOTIFY {uuid}] Unsubscribed"))
             else:
                 self.after(0, lambda: self.log(f"[NOTIFY {uuid}] Characteristic not found in index"))
         except Exception as exc:
             self.after(0, lambda m=f"[NOTIFY {uuid}] Failed to unsubscribe: {exc}": self.log(m))
+            self.after(0, lambda u=uuid, m=f"[NOTIFY {uuid}] Failed to unsubscribe: {exc}": self._append_to_char_page(u, m))
         finally:
             if self.notify_active_uuid == uuid:
                 self.notify_active_uuid = None
 
-    def _notify_started_ui(self, uuid: str):
+    # ---------- Browser-like tabs ----------
+    def _short_uuid(self, uuid: str) -> str:
+        if len(uuid) >= 8:
+            if uuid.startswith("0000") and "-" in uuid:
+                return uuid[4:8]  # 16-bit SIG part
+            return uuid[:8]
+        return uuid
+
+    def _ensure_browser_tab(self, uuid: str):
+        if uuid in self.browser_tabs:
+            return
+        title = self._short_uuid(uuid)
+        tab = ctk.CTkFrame(self.tabs_strip, corner_radius=12, fg_color="#1f1f1f")
+        tab.pack(side="left", padx=(0, 6), pady=2)
+
+        btn = ctk.CTkButton(tab, text=title, width=110, height=26, command=lambda u=uuid: self._select_browser_tab(u))
+        btn.grid(row=0, column=0, padx=(8, 4), pady=4, sticky="w")
+
+        close = ctk.CTkButton(tab, text="×", width=28, height=26, command=lambda u=uuid: self._close_browser_tab(u))
+        close.grid(row=0, column=1, padx=(0, 6), pady=4)
+
+        self.browser_tabs[uuid] = {"frame": tab, "btn": btn, "close": close}
+        # Make sure a content page exists too
+        self._ensure_char_page(uuid)
+
+    def _select_browser_tab(self, uuid: str):
+        self.active_tab_uuid = uuid
+        # Highlight active tab
+        for u, ref in self.browser_tabs.items():
+            frame: ctk.CTkFrame = ref["frame"]  # type: ignore
+            frame.configure(fg_color=("#e5e5e5" if u == uuid else "#1f1f1f"))
+        # Raise page
+        self._show_char_page(uuid)
+        # Mirror selection to combo (keeps top control buttons in sync)
+        if self.char_var.get() != uuid:
+            self.char_var.set(uuid)
+            self._on_char_selected()
+
+    def _close_browser_tab(self, uuid: str):
+        # Optional: stop notify if this tab is active
+        if self.notify_active_uuid == uuid:
+            try:
+                self.bridge.run_coro(self._stop_notify_async(uuid)).result(timeout=1.0)
+            except Exception:
+                pass
+        # Destroy tab UI
+        ref = self.browser_tabs.pop(uuid, None)
+        if ref:
+            frame: ctk.CTkFrame = ref["frame"]  # type: ignore
+            frame.destroy()
+        # Hide page
+        page = self.char_pages.pop(uuid, None)
+        if page:
+            page["frame"].destroy()
+        # Select another tab if any
+        if self.browser_tabs:
+            other_uuid = next(iter(self.browser_tabs.keys()))
+            self._select_browser_tab(other_uuid)
+        else:
+            self.active_tab_uuid = None
+
+    # ---------- Per-char pages (right-bottom) ----------
+    def _ensure_char_page(self, uuid: str):
+        if uuid in self.char_pages:
+            return
+        page = ctk.CTkFrame(self.char_pages_container)
+        page.grid(row=0, column=0, sticky="nsew")
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(2, weight=1)
+
+        props_lbl = ctk.CTkLabel(page, text=f"{uuid}\nProps: -", anchor="w", justify="left")
+        props_lbl.grid(row=0, column=0, sticky="w", padx=6, pady=(6, 0))
+
+        btns = ctk.CTkFrame(page, fg_color="transparent")
+        btns.grid(row=1, column=0, sticky="w", padx=6, pady=(6, 0))
+        btn_read = ctk.CTkButton(btns, text="Read", command=lambda u=uuid: self._read_from(u))
+        btn_read.pack(side="left", padx=(0, 6))
+        btn_sub = ctk.CTkButton(btns, text="Subscribe", command=lambda u=uuid: self._toggle_notify_for(u))
+        btn_sub.pack(side="left", padx=(0, 6))
+        btn_write = ctk.CTkButton(btns, text="Write (from global editor)", command=lambda u=uuid: self._write_from(u))
+        btn_write.pack(side="left", padx=(0, 6))
+
+        text = ctk.CTkTextbox(page, wrap="none", font=("Consolas", 11))
+        text.grid(row=2, column=0, sticky="nsew", padx=6, pady=6)
+
+        # fill props if known
+        if uuid in self.char_index:
+            _svc, ch, _h = self.char_index[uuid]
+            props = ",".join(getattr(ch, "properties", [])) or "-"
+            props_lbl.configure(text=f"{uuid}\nProps: {props}")
+
+        self.char_pages[uuid] = {
+            "frame": page,
+            "props": props_lbl,
+            "text": text,
+            "btn_read": btn_read,
+            "btn_sub": btn_sub,
+            "btn_write": btn_write,
+        }
+
+    def _show_char_page(self, uuid: str):
+        for u, page in self.char_pages.items():
+            page["frame"].grid_remove()
+        if uuid in self.char_pages:
+            self.char_pages[uuid]["frame"].grid()
+            # sync subscribe button text
+            self.char_pages[uuid]["btn_sub"].configure(
+                text=("Unsubscribe" if self.notify_active_uuid == uuid else "Subscribe")
+            )
+            # refresh props if we have them
+            if uuid in self.char_index:
+                _svc, ch, _h = self.char_index[uuid]
+                props = ",".join(getattr(ch, "properties", [])) or "-"
+                self.char_pages[uuid]["props"].configure(text=f"{uuid}\nProps: {props}")
+
+    def _append_to_char_page(self, uuid: str, line: str):
+        page = self.char_pages.get(uuid)
+        if not page:
+            return
+        text: ctk.CTkTextbox = page["text"]  # type: ignore
+        text.insert("end", line + "\n")
+        text.see("end")
+
+    # wrappers for page buttons
+    def _read_from(self, uuid: str):
+        fut = self.bridge.run_coro(self._read_async(uuid))
+        fut.add_done_callback(lambda _f: None)
+
+    def _write_from(self, uuid: str):
+        payload = self._get_bytes_from_editor()
+        if payload is None:
+            return
+        fut = self.bridge.run_coro(self._write_async(uuid, payload))
+        fut.add_done_callback(lambda _f: None)
+
+    def _toggle_notify_for(self, uuid: str):
+        if self.notify_active_uuid == uuid:
+            fut = self.bridge.run_coro(self._stop_notify_async(uuid))
+            fut.add_done_callback(lambda _f: self.after(0, self._notify_stopped_ui_for, uuid))
+        else:
+            fut = self.bridge.run_coro(self._start_notify_async(uuid))
+            fut.add_done_callback(lambda _f: self.after(0, self._notify_started_ui_for, uuid))
+
+    def _notify_started_ui_for(self, uuid: str):
         if self.char_var.get() == uuid:
             self.notify_btn.configure(text="Unsubscribe")
+        page = self.char_pages.get(uuid)
+        if page:
+            page["btn_sub"].configure(text="Unsubscribe")
+        if self.active_tab_uuid == uuid:
+            self._select_browser_tab(uuid)  # keep highlight
 
-    def _notify_stopped_ui(self):
-        self.notify_btn.configure(text="Subscribe")
+    def _notify_stopped_ui_for(self, uuid: str):
+        if self.char_var.get() == uuid:
+            self.notify_btn.configure(text="Subscribe")
+        page = self.char_pages.get(uuid)
+        if page:
+            page["btn_sub"].configure(text="Subscribe")
+        if self.active_tab_uuid == uuid:
+            self._select_browser_tab(uuid)
 
     def _notification_handler(self, sender: int, data: bytearray):
-        # Convert handle back to UUID for display
         uuid = "Unknown"
         for char_uuid, (_svc_uuid, _ch, handle) in self.char_index.items():
             if handle == sender:
                 uuid = char_uuid
                 break
-                
         hex_str = " ".join(f"{b:02X}" for b in data[:64])
         msg = f"[NOTIF {uuid}] {hex_str}" + (f" … (len={len(data)})" if len(data) > 64 else f" (len={len(data)})")
         self.after(0, lambda m=msg: self.log(m))
+        self.after(0, lambda u=uuid, m=msg: self._append_to_char_page(u, m))
         if len(data) >= 34:
             decoded = self._decode_status(data)
             self.after(0, lambda d=decoded: self._update_decoded(d))
 
-    # ---------- Byte Editor Functions ----------
+    # ---------- Byte Editor ----------
     def on_create_byte_editor(self):
         try:
             size = int(self.byte_size_var.get())
@@ -536,65 +692,45 @@ class BLEBrowserApp(ctk.CTk):
                 return
             if size > 64:
                 self.log("Warning: Large byte size may affect performance")
-                
-            # Clear existing byte editor
-            for widget in self.byte_editor_frame.winfo_children():
-                widget.destroy()
-                
+            for w in self.byte_editor_frame.winfo_children():
+                w.destroy()
             self.byte_entries = []
             self.byte_name_entries = []
-            
-            # Create header
-            header_frame = ctk.CTkFrame(self.byte_editor_frame, fg_color="transparent")
-            header_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 5))
-            
-            ctk.CTkLabel(header_frame, text="Byte Name", font=("Arial", 11, "bold")).grid(row=0, column=0, padx=(0, 10))
-            ctk.CTkLabel(header_frame, text="Value (Hex)", font=("Arial", 11, "bold")).grid(row=0, column=1, padx=(0, 10))
-            ctk.CTkLabel(header_frame, text="Index", font=("Arial", 11, "bold")).grid(row=0, column=2)
-            
-            # Create byte editor rows
+
+            header = ctk.CTkFrame(self.byte_editor_frame, fg_color="transparent")
+            header.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 5))
+            ctk.CTkLabel(header, text="Byte Name", font=("Arial", 11, "bold")).grid(row=0, column=0, padx=(0, 10))
+            ctk.CTkLabel(header, text="Value (Hex)", font=("Arial", 11, "bold")).grid(row=0, column=1, padx=(0, 10))
+            ctk.CTkLabel(header, text="Index", font=("Arial", 11, "bold")).grid(row=0, column=2)
+
             for i in range(size):
-                row_frame = ctk.CTkFrame(self.byte_editor_frame, fg_color="transparent")
-                row_frame.grid(row=i+1, column=0, columnspan=3, sticky="ew", pady=2)
-                
-                # Byte name entry
+                row = ctk.CTkFrame(self.byte_editor_frame, fg_color="transparent")
+                row.grid(row=i+1, column=0, columnspan=3, sticky="ew", pady=2)
                 name_var = ctk.StringVar(value=f"Byte {i+1}")
-                name_entry = ctk.CTkEntry(row_frame, textvariable=name_var, width=120)
-                name_entry.grid(row=0, column=0, padx=(0, 10))
+                ctk.CTkEntry(row, textvariable=name_var, width=120).grid(row=0, column=0, padx=(0, 10))
                 self.byte_name_entries.append(name_var)
-                
-                # Byte value entry
                 value_var = ctk.StringVar(value="00")
-                value_entry = ctk.CTkEntry(row_frame, textvariable=value_var, width=80)
-                value_entry.grid(row=0, column=1, padx=(0, 10))
+                ctk.CTkEntry(row, textvariable=value_var, width=80).grid(row=0, column=1, padx=(0, 10))
                 self.byte_entries.append(value_var)
-                
-                # Byte index label
-                ctk.CTkLabel(row_frame, text=f"#{i}", text_color="gray").grid(row=0, column=2)
-            
-            # Update the info label
+                ctk.CTkLabel(row, text=f"#{i}", text_color="gray").grid(row=0, column=2)
+
             self.bytes_info_lbl.configure(text=f"Bytes: {size}")
-            
             self.log(f"Created byte editor with {size} bytes")
-            
+
         except ValueError:
             self.log("Error: Please enter a valid integer for byte size")
-    
+
     def _get_bytes_from_editor(self):
-        """Convert byte editor values to bytes"""
         if not self.byte_entries:
             self.log("Error: No byte editor created. Please create one first.")
             return None
-            
         bytes_list = []
         for i, value_var in enumerate(self.byte_entries):
             value = value_var.get().strip()
             if not value:
                 self.log(f"Error: Byte #{i} value is empty")
                 return None
-                
             try:
-                # Handle single hex values (like "A" becomes "0A")
                 if len(value) == 1:
                     value = "0" + value
                 byte_val = int(value, 16) & 0xFF
@@ -602,7 +738,6 @@ class BLEBrowserApp(ctk.CTk):
             except ValueError:
                 self.log(f"Error: Invalid hex value '{value}' for byte #{i}")
                 return None
-                
         return bytes(bytes_list)
 
     # ---------- Decoding ----------
@@ -611,7 +746,6 @@ class BLEBrowserApp(ctk.CTk):
         return ((hi & 0xFF) << 8) | (lo & 0xFF)
 
     def _decode_status(self, payload: bytes) -> Dict[str, Union[List[int], int]]:
-        # Expect at least 34 bytes, but allow more
         b = payload
         if len(b) < 34:
             return {}
@@ -649,7 +783,6 @@ class BLEBrowserApp(ctk.CTk):
         if not d:
             return
 
-        # build rows if not present
         def ensure_row(name: str):
             if name in self._decoded_rows:
                 return self._decoded_rows[name]
@@ -675,15 +808,6 @@ class BLEBrowserApp(ctk.CTk):
         set_val("pressure[6]", d["pressure"])
         set_val("level[2]", d["level"])
         set_val("flowrate[4]", d["flowrate"])
-
-    # ---------- Utils ----------
-    @staticmethod
-    def _parse_hex(s: str) -> Tuple[bool, bytes]:
-        tokens = [t for t in s.replace(",", " ").replace(";", " ").split() if t]
-        try:
-            return True, bytes(int(t, 16) & 0xFF for t in tokens)
-        except Exception:
-            return False, b""
 
     # ---------- Close ----------
     def on_close(self):
