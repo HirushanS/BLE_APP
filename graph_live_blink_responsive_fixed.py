@@ -1,9 +1,10 @@
-# ble_ctk_browser_browser_tabs.py
-# BLE Browser with browser-like top tabs (CustomTkinter + Bleak)
+# ble_ctk_browser_browser_tabs_rename.py
+# BLE Browser with browser-like top tabs + renaming (CustomTkinter + Bleak)
 
 import asyncio
 import threading
 import re
+import tkinter as tk
 from typing import Optional, Dict, List, Tuple, Union
 
 import customtkinter as ctk
@@ -65,6 +66,14 @@ class BLEBrowserApp(ctk.CTk):
         self.active_tab_uuid: Optional[str] = None
         self.browser_tabs: Dict[str, Dict[str, object]] = {}   # uuid -> {frame, btn, close}
         self.char_pages: Dict[str, Dict[str, object]] = {}     # uuid -> {frame, props, text, btn_read, btn_sub, btn_write}
+        self.tab_titles: Dict[str, str] = {}                   # uuid -> display name
+        self.max_tab_title_len = 28
+
+        # right-click menu for tabs
+        self._tab_menu_uuid: Optional[str] = None
+        self._tab_menu = tk.Menu(self, tearoff=0)
+        self._tab_menu.add_command(label="Rename tab", command=lambda: self._prompt_rename_tab(self._tab_menu_uuid))
+        self._tab_menu.add_command(label="Close tab", command=lambda: self._close_browser_tab(self._tab_menu_uuid))
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -99,7 +108,7 @@ class BLEBrowserApp(ctk.CTk):
         scale.set("100%")
         scale.grid(row=0, column=8, padx=(8, 0))
 
-        # --- Browser-like top tab bar (under toolbar, full width) ---
+        # --- Browser-like top tab bar ---
         tabs_outer = ctk.CTkFrame(self, fg_color="transparent", height=36)
         tabs_outer.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
         tabs_outer.grid_columnconfigure(0, weight=1)
@@ -142,14 +151,13 @@ class BLEBrowserApp(ctk.CTk):
         self.props_lbl = ctk.CTkLabel(ctl_box, text="Props: -")
         self.props_lbl.grid(row=1, column=3, sticky="e", padx=(8, 10))
 
-        # RW/Notify (global quick buttons for current combo selection)
         self.read_btn = ctk.CTkButton(ctl_box, text="Read", state="disabled", command=self.on_read)
         self.read_btn.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="w")
 
         self.notify_btn = ctk.CTkButton(ctl_box, text="Subscribe", state="disabled", command=self.on_toggle_notify)
         self.notify_btn.grid(row=2, column=3, padx=(8, 10), pady=(0, 12), sticky="e")
 
-        # Byte size + editor (global; tabs can write using this payload)
+        # Byte editor (global)
         byte_size_frame = ctk.CTkFrame(ctl_box, fg_color="transparent")
         byte_size_frame.grid(row=3, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 10))
         byte_size_frame.grid_columnconfigure(1, weight=1)
@@ -170,7 +178,7 @@ class BLEBrowserApp(ctk.CTk):
         self.write_btn = ctk.CTkButton(ctl_box, text="Write Bytes", state="disabled", command=self.on_write)
         self.write_btn.grid(row=5, column=3, padx=(8, 10), pady=(0, 10), sticky="e")
 
-        # --- Bottom panes: Log (left) | Right (Decoded + Values + Per-char page stack) ---
+        # --- Bottom panes: Log | Right (Decoded + Values + Per-char page) ---
         bottom = ctk.CTkFrame(self)
         bottom.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
         bottom.grid_columnconfigure(0, weight=2)
@@ -374,7 +382,6 @@ class BLEBrowserApp(ctk.CTk):
         self.notify_btn.configure(text=("Unsubscribe" if self.notify_active_uuid == uuid else "Subscribe"))
 
         if uuid:
-            # Create/select a top tab and corresponding page
             self._ensure_browser_tab(uuid)
             self._ensure_char_page(uuid)
             self._select_browser_tab(uuid)
@@ -508,30 +515,68 @@ class BLEBrowserApp(ctk.CTk):
             if self.notify_active_uuid == uuid:
                 self.notify_active_uuid = None
 
-    # ---------- Browser-like tabs ----------
-    def _short_uuid(self, uuid: str) -> str:
-        if len(uuid) >= 8:
-            if uuid.startswith("0000") and "-" in uuid:
-                return uuid[4:8]  # 16-bit SIG part
-            return uuid[:8]
-        return uuid
+    # ---------- Browser-like tabs (with rename) ----------
+    def _update_tab_title(self, uuid: str):
+        """Apply ellipsis and push to button text."""
+        if uuid not in self.browser_tabs:
+            return
+        raw = self.tab_titles.get(uuid, uuid)
+        shown = (raw[: self.max_tab_title_len - 1] + "…") if len(raw) > self.max_tab_title_len else raw
+        self.browser_tabs[uuid]["btn"].configure(text=shown)
 
     def _ensure_browser_tab(self, uuid: str):
         if uuid in self.browser_tabs:
             return
-        title = self._short_uuid(uuid)
+        # default title = FULL UUID (your request)
+        self.tab_titles[uuid] = uuid
+
         tab = ctk.CTkFrame(self.tabs_strip, corner_radius=12, fg_color="#1f1f1f")
         tab.pack(side="left", padx=(0, 6), pady=2)
 
-        btn = ctk.CTkButton(tab, text=title, width=110, height=26, command=lambda u=uuid: self._select_browser_tab(u))
+        btn = ctk.CTkButton(tab, text="", width=200, height=26,
+                            command=lambda u=uuid: self._select_browser_tab(u))
         btn.grid(row=0, column=0, padx=(8, 4), pady=4, sticky="w")
+        # rename on double-click
+        btn.bind("<Double-Button-1>", lambda e, u=uuid: self._prompt_rename_tab(u))
+        # context menu (right click)
+        btn.bind("<Button-3>", lambda e, u=uuid: self._open_tab_menu(e, u))
+        tab.bind("<Button-3>", lambda e, u=uuid: self._open_tab_menu(e, u))
 
-        close = ctk.CTkButton(tab, text="×", width=28, height=26, command=lambda u=uuid: self._close_browser_tab(u))
+        close = ctk.CTkButton(tab, text="×", width=28, height=26,
+                              command=lambda u=uuid: self._close_browser_tab(u))
         close.grid(row=0, column=1, padx=(0, 6), pady=4)
 
         self.browser_tabs[uuid] = {"frame": tab, "btn": btn, "close": close}
-        # Make sure a content page exists too
+        self._update_tab_title(uuid)
+
+        # Ensure a content page exists too
         self._ensure_char_page(uuid)
+
+    def _open_tab_menu(self, event, uuid: str):
+        self._tab_menu_uuid = uuid
+        try:
+            self._tab_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._tab_menu.grab_release()
+
+    def _prompt_rename_tab(self, uuid: Optional[str]):
+        if not uuid:
+            return
+        try:
+            dialog = ctk.CTkInputDialog(text="Enter a name for this characteristic tab:",
+                                        title="Rename tab")
+            new_name = dialog.get_input()
+        except Exception:
+            # fallback simple TK dialog if CTkInputDialog unavailable
+            import tkinter.simpledialog as sd
+            new_name = sd.askstring("Rename tab", "Enter a name for this characteristic tab:")
+        if new_name:
+            new_name = new_name.strip()
+            if new_name:
+                self.tab_titles[uuid] = new_name
+                self._update_tab_title(uuid)
+                # also reflect on the page header
+                self._refresh_page_header(uuid)
 
     def _select_browser_tab(self, uuid: str):
         self.active_tab_uuid = uuid
@@ -541,28 +586,27 @@ class BLEBrowserApp(ctk.CTk):
             frame.configure(fg_color=("#e5e5e5" if u == uuid else "#1f1f1f"))
         # Raise page
         self._show_char_page(uuid)
-        # Mirror selection to combo (keeps top control buttons in sync)
+        # Mirror selection to combo
         if self.char_var.get() != uuid:
             self.char_var.set(uuid)
             self._on_char_selected()
 
-    def _close_browser_tab(self, uuid: str):
-        # Optional: stop notify if this tab is active
+    def _close_browser_tab(self, uuid: Optional[str]):
+        if not uuid:
+            return
         if self.notify_active_uuid == uuid:
             try:
                 self.bridge.run_coro(self._stop_notify_async(uuid)).result(timeout=1.0)
             except Exception:
                 pass
-        # Destroy tab UI
         ref = self.browser_tabs.pop(uuid, None)
         if ref:
             frame: ctk.CTkFrame = ref["frame"]  # type: ignore
             frame.destroy()
-        # Hide page
         page = self.char_pages.pop(uuid, None)
         if page:
             page["frame"].destroy()
-        # Select another tab if any
+        self.tab_titles.pop(uuid, None)
         if self.browser_tabs:
             other_uuid = next(iter(self.browser_tabs.keys()))
             self._select_browser_tab(other_uuid)
@@ -578,7 +622,19 @@ class BLEBrowserApp(ctk.CTk):
         page.grid_columnconfigure(0, weight=1)
         page.grid_rowconfigure(2, weight=1)
 
-        props_lbl = ctk.CTkLabel(page, text=f"{uuid}\nProps: -", anchor="w", justify="left")
+        # Header shows display name + uuid + props
+        title = self.tab_titles.get(uuid, uuid)
+        props_text = "-"
+        if uuid in self.char_index:
+            _svc, ch, _h = self.char_index[uuid]
+            props_text = ",".join(getattr(ch, "properties", [])) or "-"
+
+        props_lbl = ctk.CTkLabel(
+            page,
+            text=f"{title}  [{uuid}]\nProps: {props_text}",
+            anchor="w",
+            justify="left",
+        )
         props_lbl.grid(row=0, column=0, sticky="w", padx=6, pady=(6, 0))
 
         btns = ctk.CTkFrame(page, fg_color="transparent")
@@ -593,12 +649,6 @@ class BLEBrowserApp(ctk.CTk):
         text = ctk.CTkTextbox(page, wrap="none", font=("Consolas", 11))
         text.grid(row=2, column=0, sticky="nsew", padx=6, pady=6)
 
-        # fill props if known
-        if uuid in self.char_index:
-            _svc, ch, _h = self.char_index[uuid]
-            props = ",".join(getattr(ch, "properties", [])) or "-"
-            props_lbl.configure(text=f"{uuid}\nProps: {props}")
-
         self.char_pages[uuid] = {
             "frame": page,
             "props": props_lbl,
@@ -608,20 +658,26 @@ class BLEBrowserApp(ctk.CTk):
             "btn_write": btn_write,
         }
 
+    def _refresh_page_header(self, uuid: str):
+        page = self.char_pages.get(uuid)
+        if not page:
+            return
+        title = self.tab_titles.get(uuid, uuid)
+        props_text = "-"
+        if uuid in self.char_index:
+            _svc, ch, _h = self.char_index[uuid]
+            props_text = ",".join(getattr(ch, "properties", [])) or "-"
+        page["props"].configure(text=f"{title}  [{uuid}]\nProps: {props_text}")
+
     def _show_char_page(self, uuid: str):
         for u, page in self.char_pages.items():
             page["frame"].grid_remove()
         if uuid in self.char_pages:
             self.char_pages[uuid]["frame"].grid()
-            # sync subscribe button text
             self.char_pages[uuid]["btn_sub"].configure(
                 text=("Unsubscribe" if self.notify_active_uuid == uuid else "Subscribe")
             )
-            # refresh props if we have them
-            if uuid in self.char_index:
-                _svc, ch, _h = self.char_index[uuid]
-                props = ",".join(getattr(ch, "properties", [])) or "-"
-                self.char_pages[uuid]["props"].configure(text=f"{uuid}\nProps: {props}")
+            self._refresh_page_header(uuid)
 
     def _append_to_char_page(self, uuid: str, line: str):
         page = self.char_pages.get(uuid)
@@ -658,7 +714,7 @@ class BLEBrowserApp(ctk.CTk):
         if page:
             page["btn_sub"].configure(text="Unsubscribe")
         if self.active_tab_uuid == uuid:
-            self._select_browser_tab(uuid)  # keep highlight
+            self._select_browser_tab(uuid)
 
     def _notify_stopped_ui_for(self, uuid: str):
         if self.char_var.get() == uuid:
